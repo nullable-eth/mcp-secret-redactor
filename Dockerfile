@@ -6,7 +6,7 @@ COPY requirements.txt .
 # protobuf runtime that loads it.
 RUN pip install --no-cache-dir -r requirements.txt 'grpcio-tools==1.*' \
  && pip freeze > /tmp/constraints.txt \
- && pip install --no-cache-dir --prefix=/install -r requirements.txt -c /tmp/constraints.txt
+ && pip install --no-cache-dir --ignore-installed --prefix=/install -r requirements.txt -c /tmp/constraints.txt
 COPY proto/ proto/
 COPY redactor/ redactor/
 COPY gen.sh .
