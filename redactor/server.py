@@ -19,6 +19,7 @@ from concurrent import futures
 import grpc
 from grpc_health.v1 import health, health_pb2, health_pb2_grpc
 
+from . import rules
 from . import ext_mcp_pb2 as pb
 from . import ext_mcp_pb2_grpc as pbg
 from .engine import Redactor, Stats
@@ -28,10 +29,23 @@ log = logging.getLogger("redactor")
 
 
 class ExtMcp(pbg.ExtMcpServicer):
-    def __init__(self, redactor: Redactor, source):
+    def __init__(self, redactor: Redactor, source, request_rules=None):
         self.redactor, self.source = redactor, source
+        self.rules = request_rules or []
 
     def CheckRequest(self, request, context):
+        if self.rules and request.method == "tools/call":
+            try:
+                params = json.loads(request.mcp_request or b"{}")
+            except ValueError:
+                params = {}
+            reason = rules.check(self.rules, list(request.service_names),
+                                 params if isinstance(params, dict) else {})
+            if reason:
+                log.info("refused %s on %s: %s", request.method,
+                         ",".join(request.service_names) or "-", reason)
+                return pb.McpRequestResult(error=pb.AuthorizationError(
+                    code=pb.AuthorizationError.Code.PERMISSION_DENIED, reason=reason))
         return pb.McpRequestResult(**{"pass": pb.Pass()})
 
     def CheckResponse(self, request, context):
@@ -60,7 +74,9 @@ def serve() -> None:
     source = from_env(redactor)
     source.start()
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=int(os.environ.get("WORKERS", "8"))))
-    pbg.add_ExtMcpServicer_to_server(ExtMcp(redactor, source), server)
+    request_rules = rules.from_env()
+    log.info("%d request rule(s) loaded", len(request_rules))
+    pbg.add_ExtMcpServicer_to_server(ExtMcp(redactor, source, request_rules), server)
     health_servicer = health.HealthServicer()
     health_servicer.set("", health_pb2.HealthCheckResponse.SERVING)
     health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)

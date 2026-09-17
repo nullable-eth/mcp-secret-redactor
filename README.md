@@ -26,6 +26,24 @@ Secrets; its values never leave the process (only labels are logged).
   credential.
 - JSON-RPC error responses do not pass through ExtMcp hooks.
 
+## Request rules
+
+agentgateway's `mcpAuthorization` CEL allows or denies tools by name and target
+but cannot see arguments. `RULES_FILE` adds argument rules on `tools/call`
+(the processor needs `tools/call: full` to see requests):
+
+```yaml
+deny:
+  - target: github                      # optional, regex on the MCP target
+    tool: create_or_update_file|push_files|delete_file
+    argument: branch                    # dotted path into arguments
+    matches: main|master                # full-match regex on the value
+    missing: true                       # also deny when absent
+    reason: commit to a branch and open a pull request instead
+  - tool: merge_pull_request            # no argument: deny the tool
+    reason: a human merges
+```
+
 ## Configuration
 
 | env | default | |
@@ -34,6 +52,7 @@ Secrets; its values never leave the process (only labels are logged).
 | `REFRESH_SECONDS` | `60` | Secret reload interval |
 | `SECRET_NAMESPACES` | all | comma-separated list to restrict the source |
 | `WORKERS` | `8` | gRPC threads |
+| `RULES_FILE` | unset | request rules (YAML/JSON) |
 
 agentgateway (standalone config):
 
@@ -49,7 +68,7 @@ backends:
         port: 4445
         failureMode: failClosed
         methods:
-          tools/call: response
+          tools/call: full       # `response` if no request rules
 ```
 
 ## Development
