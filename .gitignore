@@ -1,0 +1,3 @@
+__pycache__/
+redactor/ext_mcp_pb2*.py
+.pytest_cache/
