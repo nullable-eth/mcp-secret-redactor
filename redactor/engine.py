@@ -1,10 +1,16 @@
 """Redaction engine: exact values first, patterns second.
 
-Exact values come from the cluster's own Secrets (see secrets.py). A value
-that is in a Secret is replaced wherever it appears in a tool result, in its
-common encodings, whatever the surrounding text looks like. That catches the
-password in `env` output, an API key inside an app's config file, a
-connection string in a log line: anything that matches a Secret.
+Exact values come from the cluster's own Secrets (see secrets.py). One rule
+decides which values are matched, with no guessing from what a value looks
+like: every value of at least MIN_LEN characters is redacted, unless its key
+is an ordinary one (by default user, username, host, hostname, port, dbname,
+database; set with ORDINARY_KEYS). A matched value is replaced wherever it
+appears in a tool result, in its common encodings: the password in `env`
+output, an API key inside an app's config file, a webhook URL in a log line.
+
+Over-masking is the safe failure: it shows up as a [REDACTED:...] marker in
+output and is fixed by adding the key to ORDINARY_KEYS. A missed secret would
+leak silently.
 
 Patterns cover what was never put in a Secret: credential-looking key/value
 pairs, bearer tokens, URL userinfo, private keys and well-known token formats.
@@ -14,73 +20,36 @@ from __future__ import annotations
 
 import base64
 import json
-import math
 import re
-import threading
 import urllib.parse
 from dataclasses import dataclass
 
-MIN_LEN = 8
-
-# Keys whose values are credentials whatever they look like.
-SENSITIVE_KEY = re.compile(
-    r"(pass(word|wd)?|pwd|secret|token|api[-_]?key|apikey|auth|credential|"
-    r"private|cert|\.pem|\.key$|dsn|uri|url|connection|pgpass|cookie|session|salt|seed)",
-    re.IGNORECASE)
+MIN_LEN = 8          # shorter values (ports, short names) would mask ordinary text
+LINE_MIN = 24        # lines of a multi-line value matched on their own
+DEFAULT_ORDINARY_KEYS = "user,username,host,hostname,port,dbname,database"
 
 
-def entropy(s: str) -> float:
-    if not s:
-        return 0.0
-    counts: dict[str, int] = {}
-    for ch in s:
-        counts[ch] = counts.get(ch, 0) + 1
-    return -sum(c / len(s) * math.log2(c / len(s)) for c in counts.values())
+def ordinary_keys(spec: str = DEFAULT_ORDINARY_KEYS) -> frozenset[str]:
+    return frozenset(k.strip().lower() for k in spec.split(",") if k.strip())
 
 
-def looks_secret(key: str, value: str) -> bool:
-    """Is this Secret value worth redacting on sight?
+def redactable(key: str, value: str, ordinary: frozenset[str]) -> bool:
+    """The rule: long enough, and the key's last word is not an ordinary one.
 
-    Secrets also hold ordinary values (usernames, host names, database names,
-    ports). Masking "postgres" or "shared-pg-rw.databases.svc" everywhere would
-    wreck every tool result, so a value qualifies if its key says it is a
-    credential, or if it is long and random enough to be one.
+    The last word of "unifi_username", "admin-user" or "auths.ghcr.io.username"
+    is "username"/"user", so the ordinary list names words, not every key.
     """
-    if len(value) < MIN_LEN:
-        return False
-    if SENSITIVE_KEY.search(key):
-        # A URL/URI key holds a secret only if it carries credentials.
-        if re.search(r"(uri|url|dsn|connection)", key, re.I) and "://" in value:
-            return bool(re.search(r"://[^/@\s:]+:[^/@\s]+@", value))
-        return True
-    if ORDINARY_SHAPE.match(value):
-        return False
-    return len(value) >= 16 and entropy(value) >= 3.5
-
-
-# Values that are long and varied but are locations, not credentials: DNS
-# names (optionally :port), e-mail addresses, file paths and URLs without
-# userinfo. Only consulted for keys that do not name a credential.
-ORDINARY_SHAPE = re.compile(
-    r"^(?:"
-    r"[a-z0-9-]+(?:\.[a-z0-9-]+)+(?::\d{1,5})?"      # host.name[:port]
-    r"|[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+"  # e-mail
-    r"|/[\w./-]*"                                     # /a/path
-    r"|[a-z][a-z0-9+.-]*://[^@\s]*"                   # url without userinfo
-    r")$")
+    return len(value) >= MIN_LEN and re.split(r"[._-]", key.lower())[-1] not in ordinary
 
 
 def variants(value: str) -> set[str]:
-    """The value as it may appear in text: raw, base64, URL- and JSON-escaped."""
-    out = {value}
-    out.add(base64.b64encode(value.encode()).decode())
-    out.add(urllib.parse.quote(value, safe=""))
-    out.add(json.dumps(value)[1:-1])
-    # Multi-line values (certs, kubeconfigs, pgpass) show up line by line too.
-    for line in value.splitlines():
-        line = line.strip()
-        if len(line) >= 24 or (":" in line and len(line) >= MIN_LEN and line.count(":") >= 3):
-            out.add(line)
+    """The value as it may appear in text: raw, base64, URL- and JSON-escaped,
+    and each long line of a multi-line value (certs, kubeconfigs, pgpass)."""
+    out = {value,
+           base64.b64encode(value.encode()).decode(),
+           urllib.parse.quote(value, safe=""),
+           json.dumps(value)[1:-1]}
+    out.update(line.strip() for line in value.splitlines() if len(line.strip()) >= LINE_MIN)
     return {v for v in out if len(v) >= MIN_LEN}
 
 
@@ -117,10 +86,12 @@ class Stats:
 
 
 class Redactor:
+    """Holds (needle, marker) pairs, longest needle first, swapped atomically
+    on reload. Matching is str.__contains__/str.replace per needle: plain C
+    substring search, no regex, no lock."""
+
     def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._regex: re.Pattern | None = None
-        self._labels: dict[str, str] = {}
+        self._needles: tuple[tuple[str, str], ...] = ()
         self.count = 0
 
     def load(self, values: dict[str, str]) -> None:
@@ -129,19 +100,15 @@ class Redactor:
         for value, label in values.items():
             for v in variants(value):
                 labels.setdefault(v, label)
-        ordered = sorted(labels, key=len, reverse=True)       # longest match first
-        regex = re.compile("|".join(re.escape(v) for v in ordered)) if ordered else None
-        with self._lock:
-            self._regex, self._labels, self.count = regex, labels, len(values)
+        self._needles = tuple((v, f"[REDACTED:{labels[v]}]")
+                              for v in sorted(labels, key=len, reverse=True))
+        self.count = len(values)
 
     def text(self, s: str, stats: Stats) -> str:
-        with self._lock:
-            regex, labels = self._regex, self._labels
-        if regex is not None:
-            def sub(m: re.Match) -> str:
-                stats.exact += 1
-                return f"[REDACTED:{labels.get(m.group(0), 'secret')}]"
-            s = regex.sub(sub, s)
+        for needle, marker in self._needles:
+            if needle in s:
+                stats.exact += s.count(needle)
+                s = s.replace(needle, marker)
         for pattern, fixed in PATTERNS:
             def psub(m: re.Match, fixed=fixed) -> str:
                 if "REDACTED" in m.group(0):

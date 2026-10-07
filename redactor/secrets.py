@@ -1,7 +1,7 @@
 """Loads the values to redact from the cluster's Secrets.
 
 Lists every Secret this service account may read (cluster-wide by default),
-keeps the values that look like credentials (engine.looks_secret), and
+keeps the values the rule says to redact (engine.redactable), and
 refreshes on an interval, so a new or rotated Secret is covered within a
 minute without a restart. Values never leave this process: only their labels
 ("namespace/name.key") are ever logged.
@@ -17,7 +17,7 @@ import time
 
 from kubernetes import client, config
 
-from .engine import MIN_LEN, Redactor, looks_secret
+from .engine import DEFAULT_ORDINARY_KEYS, Redactor, ordinary_keys, redactable
 
 log = logging.getLogger("redactor.secrets")
 
@@ -36,8 +36,8 @@ def _leaves(obj, prefix: str):
         yield prefix, obj
 
 
-def collect(secrets) -> dict[str, str]:
-    """value -> label, for every credential-looking value."""
+def collect(secrets, ordinary: frozenset[str] = ordinary_keys()) -> dict[str, str]:
+    """value -> label, for every value the rule says to redact."""
     out: dict[str, str] = {}
     for s in secrets:
         if s.type in SKIP_TYPES:
@@ -49,23 +49,25 @@ def collect(secrets) -> dict[str, str]:
             except (ValueError, UnicodeDecodeError):
                 continue                         # binary: not something text output carries
             label = f"{ns}/{name}.{key}"
-            if looks_secret(key, value):
+            if redactable(key, value.strip(), ordinary):
                 out.setdefault(value.strip(), label)
             # Structured values (dockerconfigjson, JSON credential files):
             # their inner credentials appear on their own in output.
             if value.lstrip().startswith(("{", "[")):
                 try:
                     for path, leaf in _leaves(json.loads(value), key):
-                        if looks_secret(path, leaf):
+                        if redactable(path, leaf, ordinary):
                             out.setdefault(leaf, f"{ns}/{name}.{path}")
                 except ValueError:
                     pass
-    return {v: l for v, l in out.items() if len(v) >= MIN_LEN}
+    return out
 
 
 class SecretSource:
-    def __init__(self, redactor: Redactor, interval: int, namespaces: list[str]):
+    def __init__(self, redactor: Redactor, interval: int, namespaces: list[str],
+                 ordinary: frozenset[str]):
         self.redactor, self.interval, self.namespaces = redactor, interval, namespaces
+        self.ordinary = ordinary
         self.loaded_at = 0.0
         try:
             config.load_incluster_config()
@@ -80,10 +82,10 @@ class SecretSource:
                 items += self.api.list_namespaced_secret(ns).items
         else:
             items = self.api.list_secret_for_all_namespaces().items
-        values = collect(items)
+        values = collect(items, self.ordinary)
         self.redactor.load(values)
         self.loaded_at = time.time()
-        log.info("loaded %d credential values from %d secrets", len(values), len(items))
+        log.info("loaded %d values to redact from %d secrets", len(values), len(items))
 
     def run(self) -> None:
         while True:
@@ -103,4 +105,6 @@ class SecretSource:
 
 def from_env(redactor: Redactor) -> SecretSource:
     ns = [n.strip() for n in os.environ.get("SECRET_NAMESPACES", "").split(",") if n.strip()]
-    return SecretSource(redactor, int(os.environ.get("REFRESH_SECONDS", "60")), ns)
+    ordinary = ordinary_keys(os.environ.get("ORDINARY_KEYS", DEFAULT_ORDINARY_KEYS))
+    log.info("ordinary keys (not redacted): %s", ",".join(sorted(ordinary)))
+    return SecretSource(redactor, int(os.environ.get("REFRESH_SECONDS", "60")), ns, ordinary)
