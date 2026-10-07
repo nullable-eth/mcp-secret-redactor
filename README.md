@@ -21,9 +21,13 @@ Secrets; its values never leave the process (only labels are logged).
 - **Fail closed:** if the Secret set has not refreshed for 5 × `REFRESH_SECONDS`
   the result is refused. Use `failureMode: failClosed` on the processor so an
   unreachable redactor also refuses.
-- Secret values that are ordinary (short values, host names, paths, e-mail
-  addresses, URLs without credentials) are not masked unless their key names a
-  credential.
+- **One rule decides what is masked:** every Secret value of 8 characters or
+  more, unless the last word of its key is in `ORDINARY_KEYS` (`unifi_username`
+  and `admin-user` end in `username`/`user`). Nothing is judged by what a value
+  looks like. A value that should not be masked shows up as a marker in output;
+  add its key's last word to `ORDINARY_KEYS`.
+- Lines of 24 characters or more in a multi-line value (certs, kubeconfigs,
+  pgpass files) are matched on their own as well.
 - JSON-RPC error responses do not pass through ExtMcp hooks.
 
 ## Request rules
@@ -51,6 +55,7 @@ deny:
 | `PORT` | `4445` | gRPC (h2c) |
 | `REFRESH_SECONDS` | `60` | Secret reload interval |
 | `SECRET_NAMESPACES` | all | comma-separated list to restrict the source |
+| `ORDINARY_KEYS` | `user,username,host,hostname,port,dbname,database` | key last-words whose values are not masked (replaces the default) |
 | `WORKERS` | `8` | gRPC threads |
 | `RULES_FILE` | unset | request rules (YAML/JSON) |
 

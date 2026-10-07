@@ -13,12 +13,13 @@ import pytest
 
 from redactor import ext_mcp_pb2 as pb
 from redactor import ext_mcp_pb2_grpc as pbg
-from redactor.engine import Redactor, Stats, looks_secret
+from redactor.engine import Redactor, Stats, ordinary_keys, redactable
 from redactor.secrets import collect
 from redactor.server import ExtMcp
 
 DB_PASS = "S3cr3t-Pg-Passw0rd-xyz"
 API_KEY = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"
+WEBHOOK = "https://discord.com/api/webhooks/123456/AbCdEf-token-in-the-path"
 
 
 def secret(ns, name, data, type_="Opaque"):
@@ -33,6 +34,7 @@ SECRETS = [
         "password": DB_PASS,
         "uri": f"postgresql://sonarr:{DB_PASS}@shared-pg-rw.databases.svc:5432/sonarr"}),
     secret("media", "arr-api-keys", {"SONARR_API_KEY": API_KEY}),
+    secret("media", "notify", {"discord_webhook_url": WEBHOOK}),
     secret("ai", "registry", {".dockerconfigjson": json.dumps(
         {"auths": {"ghcr.io": {"username": "bot", "password": "ghcr-registry-pw-123"}}})},
         type_="kubernetes.io/dockerconfigjson"),
@@ -117,12 +119,26 @@ def test_kubernetes_field_names_are_not_mistaken_for_credentials(red):
         assert out == text, out
 
 
-def test_looks_secret():
-    assert looks_secret("password", "short-but-8")
-    assert not looks_secret("username", "sonarr-user")
-    assert not looks_secret("uri", "http://shared-pg-rw:5432/db")
-    assert looks_secret("uri", "postgres://u:p4ssword@h/db")
-    assert looks_secret("random", "Zq8#kP2@xL9!mN4$vB7^")
+def test_the_rule():
+    o = ordinary_keys()
+    # every value of MIN_LEN or more, whatever its key or shape...
+    assert redactable("password", "short-but-8", o)
+    assert redactable("value", "aaaaaaaa", o)                    # no entropy test
+    assert redactable("discord_webhook_url", "https://discord.com/api/webhooks/1/abc", o)
+    assert redactable("SESSION_SECRET", "something", o)
+    # ...unless the key's last word is ordinary
+    for key in ("username", "unifi_username", "admin-user", "HOST", "port",
+                "auths.ghcr.io.username", "dbname"):
+        assert not redactable(key, "long-enough-value", o), key
+    # under MIN_LEN is never matched
+    assert not redactable("password", "short", o)
+    # the list is configuration, not code
+    assert not redactable("restic_repository", "s3:http://minio/x", ordinary_keys("repository"))
+
+
+def test_url_with_a_token_in_the_path(red):
+    out, _ = run(red, f"posting to {WEBHOOK}")
+    assert WEBHOOK not in out and "media/notify.discord_webhook_url" in out
 
 
 def test_json_structure_including_keys(red):
