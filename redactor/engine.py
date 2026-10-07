@@ -102,7 +102,9 @@ PATTERNS: list[tuple[re.Pattern, str]] = [
     # well-known token formats
     (re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{30,}\b|\bgithub_pat_[A-Za-z0-9_]{40,}\b"),
      "[REDACTED:github-token]"),
-    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"),
+    # Ends on a lookahead, not \b: a base64url signature can end in "-", and
+    # \b there backtracked and left the tail of the token in the result.
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_-])"),
      "[REDACTED:jwt]"),
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[REDACTED:aws-key]"),
 ]

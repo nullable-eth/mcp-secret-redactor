@@ -97,6 +97,18 @@ def test_patterns_for_values_not_in_secrets(red):
         assert leaked not in out, (text, out)
 
 
+def test_serviceaccount_token_read_bare(red):
+    # `cat /var/run/secrets/kubernetes.io/serviceaccount/token` prints a bare
+    # JWT: no "Bearer", no key, and a projected token is not a Secret object.
+    # base64url signatures can end in "-"; none of the token may survive.
+    header = "eyJhbGciOiJSUzI1NiIsImtpZCI6ImFiYyJ9"
+    payload = "eyJzdWIiOiJzeXN0ZW06c2VydmljZWFjY291bnQ6YWk6Y2x1c3Rlci1hZ2VudCJ9"
+    for sig in ("Qk3x_9a-ZpT2" * 20, "Qk3x_9a-ZpT2" * 20 + "-", "Qk3x_9a-ZpT2" * 20 + "--"):
+        token = f"{header}.{payload}.{sig}"
+        out, _ = run(red, token + "\n")
+        assert out == "[REDACTED:jwt]\n", out
+
+
 def test_kubernetes_field_names_are_not_mistaken_for_credentials(red):
     for text in ("secretName: grafana-pg-credentials",
                  "secretKeyRef: {name: llm-api-key, key: API_KEY}",
